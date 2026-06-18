@@ -1,0 +1,166 @@
+import express from "express";
+import { requireAdmin } from "../middleware/auth.mjs";
+import Order from "../models/Order.mjs";
+import Escrow from "../models/Escrow.mjs";
+import Farmer from "../models/Farmer.mjs";
+import { refundEscrowForOrder, releaseEscrowToFarmer } from "../lib/escrowLedger.mjs";
+
+const router = express.Router();
+
+// Admin: List all escrow transactions
+router.get("/", requireAdmin, async (req, res) => {
+  try {
+    const { status, farmerId, limit = 10, offset = 0 } = req.query;
+    const filter = {};
+    if (status) filter.status = status;
+    if (farmerId) filter.farmerId = farmerId;
+
+    const total = await Escrow.countDocuments(filter);
+    const escrows = await Escrow.find(filter)
+      .populate("buyerId", "name email")
+      .populate("farmerId", "fullName farmName location phone")
+      .populate("orderId", "status items total createdAt deliveryAddress paymentStatus escrowStatus")
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip(parseInt(offset));
+
+    res.json({
+      success: true,
+      total,
+      escrows,
+    });
+  } catch (error) {
+    console.error("Escrow list error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get summary stats
+router.get("/stats/summary", requireAdmin, async (req, res) => {
+  try {
+    const totalPending = await Escrow.countDocuments({ status: "pending" });
+    const totalReleased = await Escrow.countDocuments({ status: "released" });
+    const totalRefunded = await Escrow.countDocuments({ status: "refunded" });
+
+    const pendingAmount = await Escrow.aggregate([
+      { $match: { status: "pending" } },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
+
+    const releasedAmount = await Escrow.aggregate([
+      { $match: { status: "released" } },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
+
+    res.json({
+      success: true,
+      stats: {
+        totalPending,
+        totalReleased,
+        totalRefunded,
+        pendingAmount: pendingAmount[0]?.total || 0,
+        releasedAmount: releasedAmount[0]?.total || 0,
+      },
+    });
+  } catch (error) {
+    console.error("Stats error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: Get escrow detail
+router.get("/:id", requireAdmin, async (req, res) => {
+  try {
+    const escrow = await Escrow.findById(req.params.id)
+      .populate("orderId")
+      .populate("buyerId", "name email phone")
+      .populate("farmerId", "fullName farmName location farmAddress phone bankDetails")
+      .populate("releasedBy", "name email")
+      .populate("refundedBy", "name email");
+
+    if (!escrow) {
+      return res.status(404).json({ error: "Escrow not found" });
+    }
+
+    res.json({
+      success: true,
+      escrow,
+    });
+  } catch (error) {
+    console.error("Escrow detail error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: Release escrow funds
+router.post("/:id/release", requireAdmin, async (req, res) => {
+  try {
+    const { releaseNotes } = req.body;
+    const escrow = await Escrow.findById(req.params.id);
+
+    if (!escrow) {
+      return res.status(404).json({ error: "Escrow not found" });
+    }
+
+    const { order } = await releaseEscrowToFarmer(escrow, {
+      adminUserId: req.userId,
+      releaseNotes,
+    });
+
+    // TODO: Send email notification to farmer
+    // This would integrate with your email service
+    const farmer = await Farmer.findById(escrow.farmerId).populate("userId");
+    if (farmer && farmer.userId && farmer.userId.email) {
+      // TODO: sendPayoutNotificationEmail(farmer.userId.email, escrow.amount, order);
+      console.log(
+        `[EMAIL] Payout notification would be sent to ${farmer.userId.email}`
+      );
+    }
+
+    res.json({
+      success: true,
+      message: "Escrow funds released successfully",
+      escrow,
+      order,
+    });
+  } catch (error) {
+    console.error("Escrow release error:", error);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// Admin: Refund escrow (for cancelled orders)
+router.post("/:id/refund", requireAdmin, async (req, res) => {
+  try {
+    const { refundReason } = req.body;
+    const escrow = await Escrow.findById(req.params.id);
+
+    if (!escrow) {
+      return res.status(404).json({ error: "Escrow not found" });
+    }
+
+    if (escrow.status === "refunded") {
+      return res.status(400).json({ error: "Escrow already refunded" });
+    }
+
+    const order = await Order.findById(escrow.orderId);
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+    await refundEscrowForOrder(order, {
+      reason: refundReason || "Refunded by admin",
+      actorUserId: req.userId,
+    });
+
+    res.json({
+      success: true,
+      message: "Escrow refunded successfully",
+      escrow,
+    });
+  } catch (error) {
+    console.error("Escrow refund error:", error);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+export default router;
