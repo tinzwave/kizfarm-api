@@ -2,6 +2,7 @@ import Escrow from "../models/Escrow.mjs";
 import Farmer from "../models/Farmer.mjs";
 import Order from "../models/Order.mjs";
 import User from "../models/User.mjs";
+import { restoreStockForOrder } from "./inventory.mjs";
 
 export async function releaseEscrowToFarmer(escrow, { adminUserId, releaseNotes } = {}) {
   const order = await Order.findById(escrow.orderId);
@@ -66,6 +67,7 @@ export async function refundEscrowForOrder(order, { reason, actorUserId } = {}) 
       order.escrowStatus = "refunded";
       await order.save();
     }
+    await restoreStockForOrder(order);
     return { escrow, order };
   }
 
@@ -84,6 +86,7 @@ export async function refundEscrowForOrder(order, { reason, actorUserId } = {}) 
   order.paymentStatus = "refunded";
   order.escrowStatus = "refunded";
   await order.save();
+  await restoreStockForOrder(order);
 
   await User.updateOne(
     {

@@ -16,10 +16,7 @@ export function parseToken(req) {
 
 export function requireAuth(req, res, next) {
   const payload = parseToken(req);
-  console.log("Auth check - Authorization header:", req.headers?.authorization);
-  console.log("Auth check - Parsed payload:", payload);
   if (!payload) {
-    console.log("Auth failed - No valid payload");
     return res.status(401).json({ error: "Unauthorized" });
   }
   req.user = payload;

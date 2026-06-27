@@ -44,6 +44,8 @@ const OrderSchema = new Schema(
       default: "pending",
     },
     paidAt: { type: Date, default: null },
+    stockAdjusted: { type: Boolean, default: false },
+    stockAdjustedAt: { type: Date, default: null },
 
     // Escrow Management
     escrowStatus: {
@@ -66,6 +68,8 @@ const OrderSchema = new Schema(
     status: {
       type: String,
       enum: [
+        "awaiting_transport_quote", // placed, awaiting admin transport fare
+        "awaiting_payment", // transport fare added, awaiting buyer payment
         "pending",       // placed, awaiting farmer confirmation
         "accepted_by_farmer", // farmer accepted; awaiting admin confirmation
         "confirmed",     // farmer confirmed

@@ -11,6 +11,7 @@ import ordersAdminRoutes from "./routes/orders.mjs";
 import farmerOrdersRoutes from "./routes/farmerOrders.mjs";
 import escrowRoutes from "./routes/escrow.mjs";
 import learningRoutes from "./routes/learning.mjs";
+import blogRoutes from "./routes/blog.mjs";
 
 const app = express();
 
@@ -28,6 +29,7 @@ app.use("/admin/escrow", escrowRoutes);  // escrow management
 app.use("/buyer", buyerRoutes);
 app.use("/chat", chatRoutes);
 app.use("/learning", learningRoutes);
+app.use("/blog", blogRoutes);
 
 app.get("/", (req, res) => res.json({ ok: true, message: "KIZ FARM API" }));
 

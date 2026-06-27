@@ -8,7 +8,13 @@ import User from "../models/User.mjs";
 import { requireAdmin, requireAuth } from "../middleware/auth.mjs";
 import { uploadBuffer } from "../lib/cloudinaryUpload.mjs";
 import { verifyPaystackPayment } from "../lib/paystack.mjs";
-
+import {
+  notifyEmail,
+  sendCourseSubmittedEmail,
+  sendCourseReviewedEmail,
+  sendCoursePurchaseEmails,
+  sendCoursePayoutReleasedEmail
+} from "../lib/mailer.mjs";
 const router = express.Router();
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -205,6 +211,14 @@ router.post("/buyer/courses", requireAuth, async (req, res) => {
       rejectionReason: null,
     });
 
+    const creator = await User.findById(userIdFrom(req));
+    if (creator?.email) {
+      notifyEmail(
+        "Course submission alert",
+        sendCourseSubmittedEmail(course, creator.email)
+      );
+    }
+
     const populated = await populateCourseQuery(Course.findById(course._id));
     return res.status(201).json({ ok: true, course: populated });
   } catch (err) {
@@ -300,6 +314,14 @@ router.patch("/admin/buyer-courses/:id/review", requireAdmin, async (req, res) =
     course.reviewedAt = new Date();
     await course.save();
 
+    const creator = await User.findById(course.creator);
+    if (creator?.email) {
+      notifyEmail(
+        "Course review notification",
+        sendCourseReviewedEmail(course, creator.email)
+      );
+    }
+
     const populated = await populateCourseQuery(Course.findById(course._id));
     return res.json({ ok: true, course: populated });
   } catch (err) {
@@ -360,6 +382,14 @@ router.post("/admin/course-purchases/:id/release-payout", requireAdmin, async (r
     purchase.releasedAt = new Date();
     purchase.releasedBy = userIdFrom(req);
     await purchase.save();
+
+    const creator = await User.findById(purchase.course.creator);
+    if (creator?.email) {
+      notifyEmail(
+        "Course payout released notification",
+        sendCoursePayoutReleasedEmail(purchase, creator.email)
+      );
+    }
 
     await User.findByIdAndUpdate(purchase.course.creator, {
       $inc: { accountBalance: creatorAmount },
@@ -448,6 +478,9 @@ router.post("/subscriptions", requireAuth, async (req, res) => {
       });
     }
 
+    const existingSub = await Subscription.findOne({ user: userIdFrom(req), course: course._id });
+    const isNewPurchase = !existingSub || existingSub.status !== "active";
+
     const subscription = await Subscription.findOneAndUpdate(
       { user: userIdFrom(req), course: course._id },
       {
@@ -470,6 +503,23 @@ router.post("/subscriptions", requireAuth, async (req, res) => {
         { path: "creator", select: "name email" },
       ],
     });
+
+    if (isNewPurchase) {
+      const populated = await Subscription.findById(subscription._id)
+        .populate({
+          path: "course",
+          populate: [
+            { path: "tutor" },
+            { path: "creator", select: "name email" },
+          ],
+        })
+        .populate("user", "name email");
+
+      notifyEmail(
+        "Course purchase notification",
+        sendCoursePurchaseEmails(populated)
+      );
+    }
 
     return res.json({ ok: true, subscription });
   } catch (err) {

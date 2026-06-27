@@ -8,6 +8,12 @@ import Product from "../models/Product.mjs";
 import Review from "../models/Review.mjs";
 import { requireAdmin } from "../middleware/auth.mjs";
 import { refundEscrowForOrder } from "../lib/escrowLedger.mjs";
+import {
+  notifyEmail,
+  sendFarmerVerificationEmail,
+  sendOrderStatusEmail,
+  sendAdminOrderStatusEmail
+} from "../lib/mailer.mjs";
 
 const router = express.Router();
 
@@ -102,6 +108,16 @@ router.post("/verify-farmers/:id/approve", requireAdmin, async (req, res) => {
     await farmer.save();
     // grant farmer role to user
     await User.findByIdAndUpdate(farmer.userId, { role: "farmer" });
+
+    // Send verification email
+    const user = await User.findById(farmer.userId);
+    if (user?.email) {
+      notifyEmail(
+        "Farmer account approved notification",
+        sendFarmerVerificationEmail(farmer, user.email, true)
+      );
+    }
+
     return res.json({ ok: true, farmer });
   } catch (err) {
     console.error(err);
@@ -120,6 +136,16 @@ router.post("/verify-farmers/:id/reject", requireAdmin, async (req, res) => {
     await farmer.save();
     // optionally remove farmer role
     await User.findByIdAndUpdate(farmer.userId, { role: "user" });
+
+    // Send verification email
+    const user = await User.findById(farmer.userId);
+    if (user?.email) {
+      notifyEmail(
+        "Farmer account rejected notification",
+        sendFarmerVerificationEmail(farmer, user.email, false)
+      );
+    }
+
     return res.json({ ok: true, farmer });
   } catch (err) {
     console.error(err);
@@ -678,6 +704,26 @@ router.post("/orders/:id/cancel", requireAdmin, async (req, res) => {
       reason: reason || "Order cancelled by admin",
       actorUserId: req.userId,
     });
+
+    // Send notifications to buyer, farmer, and admin
+    const buyer = await User.findById(order.buyerId);
+    const farmer = await Farmer.findById(order.farmerId).populate("userId", "email");
+    if (buyer?.email) {
+      notifyEmail(
+        "Buyer order cancelled notification",
+        sendOrderStatusEmail(order, buyer.email, "Order cancelled", `Your order has been cancelled. Reason: ${order.cancellationReason || "Cancelled by admin"}`)
+      );
+    }
+    if (farmer?.userId?.email) {
+      notifyEmail(
+        "Farmer order cancelled notification",
+        sendOrderStatusEmail(order, farmer.userId.email, "Order cancelled", `The order has been cancelled. Reason: ${order.cancellationReason || "Cancelled by admin"}`)
+      );
+    }
+    notifyEmail(
+      "Admin order cancelled notification",
+      sendAdminOrderStatusEmail(order, "Order cancelled record", `Order was cancelled. Reason: ${order.cancellationReason || "Cancelled by admin"}`)
+    );
 
     res.json({
       ok: true,

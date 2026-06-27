@@ -4,38 +4,14 @@ import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import User from "../models/User.mjs";
 import Otp from "../models/Otp.mjs";
+import { sendOtpEmail, notifyEmail } from "../lib/mailer.mjs";
 
 const router = express.Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || "replace_this_with_a_secret";
-const RESEND_API_KEY = "re_i8FPocXm_9PUTifqHT1RuZ2vD4VnBCiZr";
-const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@myschoolmanager.org";
 
 function generateCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-async function sendOtpEmail(email, code) {
-  if (!RESEND_API_KEY) {
-    console.warn("RESEND_API_KEY not set — skipping email send. OTP:", code);
-    return;
-  }
-
-  const payload = {
-    from: FROM_EMAIL,
-    to: email,
-    subject: "Your KIZ FARM verification code",
-    html: `<p>Your verification code is <strong>${code}</strong>. It expires in 10 minutes.</p>`,
-  };
-
-  await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${RESEND_API_KEY}`,
-    },
-    body: JSON.stringify(payload),
-  });
 }
 
 router.post("/signup", async (req, res) => {
@@ -56,7 +32,7 @@ router.post("/signup", async (req, res) => {
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     await Otp.create({ userId: user._id, codeHash, expiresAt });
-    await sendOtpEmail(email, code);
+    notifyEmail("OTP signup notification", sendOtpEmail(email, code));
 
     return res.json({ ok: true, message: "User created, OTP sent to email" });
   } catch (err) {
@@ -76,7 +52,7 @@ router.post("/resend-otp", async (req, res) => {
     const codeHash = await bcrypt.hash(code, 10);
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     await Otp.create({ userId: user._id, codeHash, expiresAt });
-    await sendOtpEmail(email, code);
+    notifyEmail("OTP resend notification", sendOtpEmail(email, code));
 
     return res.json({ ok: true, message: "OTP resent" });
   } catch (err) {
@@ -120,8 +96,18 @@ router.post("/login", async (req, res) => {
 
     const user = await User.findOne({ email });
     if (!user) return res.status(400).json({ error: "Invalid credentials" });
-    if (!user.isVerified)
-      return res.status(403).json({ error: "Email not verified" });
+    if (!user.isVerified) {
+      const code = generateCode();
+      const codeHash = await bcrypt.hash(code, 10);
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      await Otp.create({ userId: user._id, codeHash, expiresAt });
+      notifyEmail("OTP login notification", sendOtpEmail(user.email, code));
+      return res.status(403).json({
+        error: "Email not verified",
+        needsVerification: true,
+        email: user.email,
+      });
+    }
 
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(400).json({ error: "Invalid credentials" });

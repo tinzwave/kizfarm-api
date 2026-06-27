@@ -4,6 +4,12 @@ import Order from "../models/Order.mjs";
 import Farmer from "../models/Farmer.mjs";
 import { requireAuth } from "../middleware/auth.mjs";
 import { refundEscrowForOrder } from "../lib/escrowLedger.mjs";
+import User from "../models/User.mjs";
+import {
+  notifyEmail,
+  sendOrderStatusEmail,
+  sendAdminOrderStatusEmail
+} from "../lib/mailer.mjs";
 
 const router = express.Router();
 
@@ -85,6 +91,18 @@ router.post("/:id/accept", requireAuth, async (req, res) => {
     if (req.body.notes) order.farmerNotes = req.body.notes;
     await order.save();
 
+    const buyer = await User.findById(order.buyerId);
+    if (buyer?.email) {
+      notifyEmail(
+        "Buyer order accepted notification",
+        sendOrderStatusEmail(order, buyer.email, "Farmer accepted your order", "The farmer has accepted your order, and it is now awaiting confirmation from our admin team.")
+      );
+    }
+    notifyEmail(
+      "Admin order accepted notification",
+      sendAdminOrderStatusEmail(order, "Farmer accepted", "Farmer has accepted the order. It is now ready for admin confirmation.")
+    );
+
     return res.json({ ok: true, order });
   } catch (err) {
     console.error(err);
@@ -121,6 +139,18 @@ router.post("/:id/reject", requireAuth, async (req, res) => {
       actorUserId: req.user.sub,
     });
 
+    const buyer = await User.findById(order.buyerId);
+    if (buyer?.email) {
+      notifyEmail(
+        "Buyer order rejected notification",
+        sendOrderStatusEmail(order, buyer.email, "Order rejected and refund pending", `We regret to inform you that the farmer rejected your order. A refund has been initiated to your balance. Reason: ${order.cancellationReason || "Rejected by farmer"}`)
+      );
+    }
+    notifyEmail(
+      "Admin order rejected notification",
+      sendAdminOrderStatusEmail(order, "Farmer rejected order", `Farmer rejected the order. A refund has been initiated. Reason: ${order.cancellationReason || "Rejected by farmer"}`)
+    );
+
     return res.json({ ok: true, order });
   } catch (err) {
     console.error(err);
@@ -156,6 +186,18 @@ router.post("/:id/pack", requireAuth, async (req, res) => {
     order.status = "packed";
     order.packedAt = new Date();
     await order.save();
+
+    const buyer = await User.findById(order.buyerId);
+    if (buyer?.email) {
+      notifyEmail(
+        "Buyer order packed notification",
+        sendOrderStatusEmail(order, buyer.email, "Your order has been packed", "The farmer has packed your order. It is now ready for pickup.")
+      );
+    }
+    notifyEmail(
+      "Admin order packed notification",
+      sendAdminOrderStatusEmail(order, "Order is packed and ready for driver/logistics", "The farmer has marked the order as packed. You can now assign a driver.")
+    );
 
     return res.json({ ok: true, order });
   } catch (err) {

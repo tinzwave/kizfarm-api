@@ -10,6 +10,12 @@ import User from "../models/User.mjs";
 import { requireAdmin } from "../middleware/auth.mjs";
 import { uploadBuffer } from "../lib/cloudinaryUpload.mjs";
 import { refundEscrowForOrder } from "../lib/escrowLedger.mjs";
+import {
+  notifyEmail,
+  sendBuyerTransportFareAddedEmail,
+  sendOrderStatusEmail,
+  sendAdminOrderStatusEmail
+} from "../lib/mailer.mjs";
 
 const router = express.Router();
 const upload = multer({
@@ -193,6 +199,21 @@ router.post("/orders/:id/assign-driver", requireAdmin, async (req, res) => {
     driver.currentOrderId = order._id;
     await driver.save();
 
+    const buyer = await User.findById(order.buyerId);
+    const farmer = await Farmer.findById(order.farmerId).populate("userId", "email");
+    if (buyer?.email) {
+      notifyEmail(
+        "Buyer driver assigned notification",
+        sendOrderStatusEmail(order, buyer.email, "Driver assigned", "A driver has been assigned to your order.")
+      );
+    }
+    if (farmer?.userId?.email) {
+      notifyEmail(
+        "Farmer driver assigned notification",
+        sendOrderStatusEmail(order, farmer.userId.email, "Driver assigned for pickup", "A driver has been assigned to pick up your order.")
+      );
+    }
+
     const populated = await order.populate(
       "driverId",
       "name phone vehicleType",
@@ -210,6 +231,8 @@ router.patch("/orders/:id/status", requireAdmin, async (req, res) => {
     const { status, notes } = req.body;
 
     const validStatuses = [
+      "awaiting_transport_quote",
+      "awaiting_payment",
       "pending",
       "accepted_by_farmer",
       "confirmed",
@@ -286,6 +309,105 @@ router.patch("/orders/:id/status", requireAdmin, async (req, res) => {
         reason: notes || "Order cancelled by admin",
         actorUserId: req.userId,
       }).catch(err => console.error("Refund error:", err));
+    }
+
+    // Send status transition emails
+    const buyer = await User.findById(order.buyerId);
+    const farmer = await Farmer.findById(order.farmerId).populate("userId", "email");
+    const buyerEmail = buyer?.email;
+    const farmerEmail = farmer?.userId?.email;
+
+    if (status === "confirmed") {
+      if (buyerEmail) {
+        notifyEmail(
+          "Buyer order confirmed notification",
+          sendOrderStatusEmail(order, buyerEmail, "Order confirmed", "Your order has been confirmed by admin.")
+        );
+      }
+      if (farmerEmail) {
+        notifyEmail(
+          "Farmer order confirmed notification",
+          sendOrderStatusEmail(order, farmerEmail, "Order confirmed", "The order has been confirmed by admin.")
+        );
+      }
+    } else if (status === "in_transit") {
+      if (buyerEmail) {
+        notifyEmail(
+          "Buyer order in transit notification",
+          sendOrderStatusEmail(order, buyerEmail, "Order in transit", "Your order is now in transit and on its way to you.")
+        );
+      }
+    } else if (status === "delivered") {
+      if (buyerEmail) {
+        notifyEmail(
+          "Buyer order delivered notification",
+          sendOrderStatusEmail(order, buyerEmail, "Order delivered", "Your order has been delivered. Please confirm receipt in the app.")
+        );
+      }
+    } else if (status === "cancelled") {
+      if (buyerEmail) {
+        notifyEmail(
+          "Buyer order cancelled notification",
+          sendOrderStatusEmail(order, buyerEmail, "Order cancelled", `Your order was cancelled. Reason: ${order.cancellationReason || "No reason specified"}`)
+        );
+      }
+      if (farmerEmail) {
+        notifyEmail(
+          "Farmer order cancelled notification",
+          sendOrderStatusEmail(order, farmerEmail, "Order cancelled", `The order was cancelled. Reason: ${order.cancellationReason || "No reason specified"}`)
+        );
+      }
+      notifyEmail(
+        "Admin order cancelled notification",
+        sendAdminOrderStatusEmail(order, "Order cancelled record", `Order was cancelled. Reason: ${order.cancellationReason || "No reason specified"}`)
+      );
+    }
+
+    return res.json({ ok: true, order });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PATCH /admin/orders/:id/transport-fare - add/update quoted transport fare
+router.patch("/orders/:id/transport-fare", requireAdmin, async (req, res) => {
+  try {
+    const transportFare = Number(req.body.transportFare ?? req.body.deliveryFee);
+    const notes = req.body.notes;
+
+    if (!Number.isFinite(transportFare) || transportFare < 0) {
+      return res.status(400).json({ error: "Transport fare must be a valid amount." });
+    }
+
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    if (!["awaiting_transport_quote", "awaiting_payment"].includes(order.status)) {
+      return res.status(400).json({
+        error: `Transport fare can only be added before payment. Current status: ${order.status}`,
+      });
+    }
+
+    order.deliveryFee = transportFare;
+    order.total = order.subtotal + (order.serviceFee || 0) + transportFare;
+    order.status = "awaiting_payment";
+    order.adminNotes = notes || `Transport fare added: ₦${transportFare.toLocaleString("en-NG")}`;
+    if (!order.statusNotes) order.statusNotes = [];
+    order.statusNotes.push({
+      status: "awaiting_payment",
+      note: order.adminNotes,
+      createdAt: new Date(),
+    });
+
+    await order.save();
+
+    const buyer = await User.findById(order.buyerId);
+    if (buyer?.email) {
+      notifyEmail(
+        "Buyer transport fare added notification",
+        sendBuyerTransportFareAddedEmail(order, buyer.email)
+      );
     }
 
     return res.json({ ok: true, order });

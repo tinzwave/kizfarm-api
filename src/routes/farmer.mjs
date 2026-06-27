@@ -6,6 +6,11 @@ import Product from "../models/Product.mjs";
 import { requireAuth } from "../middleware/auth.mjs";
 import { v2 as cloudinary } from "cloudinary";
 import streamifier from "streamifier";
+import {
+  notifyEmail,
+  sendFarmerApplicationSubmittedEmail,
+  sendFarmerApplicationReceivedEmail
+} from "../lib/mailer.mjs";
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -242,6 +247,18 @@ router.post(
       // clear previous rejection reason when resubmitting
       farmer.rejectionReason = undefined;
       await farmer.save();
+
+      const user = await User.findById(userId);
+      if (user?.email) {
+        notifyEmail(
+          "Admin farmer application pending alert",
+          sendFarmerApplicationSubmittedEmail(farmer)
+        );
+        notifyEmail(
+          "Farmer application confirmation",
+          sendFarmerApplicationReceivedEmail(farmer, user.email)
+        );
+      }
 
       return res.json({ ok: true, farmer });
     } catch (err) {

@@ -12,6 +12,17 @@ import Driver from "../models/Driver.mjs";
 import { requireAuth } from "../middleware/auth.mjs";
 import { refundEscrowForOrder } from "../lib/escrowLedger.mjs";
 import { verifyPaystackPayment } from "../lib/paystack.mjs";
+import { decrementStockForOrder } from "../lib/inventory.mjs";
+import {
+  notifyEmail,
+  sendAdminTransportQuoteNeededEmail,
+  sendBuyerOrderSubmittedEmail,
+  sendBuyerPaymentSuccessfulEmail,
+  sendFarmerNewPaidOrderEmail,
+  sendAdminOrderPaidEmail,
+  sendOrderStatusEmail,
+  sendAdminOrderStatusEmail
+} from "../lib/mailer.mjs";
 
 const router = express.Router();
 
@@ -19,7 +30,7 @@ router.get("/dashboard", requireAuth, async (req, res) => {
   try {
     const userId = req.user.sub;
     const [products, recentOrders, orderCount, cart] = await Promise.all([
-      Product.find()
+      Product.find({ quantity: { $ne: 0 } })
         .populate("farmerId", "_id farmName location")
         .sort({ createdAt: -1 })
         .limit(8),
@@ -160,10 +171,10 @@ router.delete("/addresses/:id", requireAuth, async (req, res) => {
  *   addressId: string,        // saved address OR inline address object
  *   address: { label, street, city, state, phone },  // alternative to addressId
  *   paymentMethod: string,
- *   paymentReference: string, // reference from payment gateway (not card details)
  * }
  *
- * This handler splits a cart into one Order per farmer.
+ * This handler splits a cart into one unpaid Order per farmer.
+ * Admin adds transport fare before the buyer can pay.
  */
 router.post("/orders", requireAuth, async (req, res) => {
   try {
@@ -173,7 +184,6 @@ router.post("/orders", requireAuth, async (req, res) => {
       addressId,
       address: inlineAddress,
       paymentMethod,
-      paymentReference,
     } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {
@@ -235,13 +245,10 @@ router.post("/orders", requireAuth, async (req, res) => {
       farmerMap.get(farmerKey).push({ product, quantity: requestedQuantity });
     }
 
-    const DELIVERY_FEE = 1500; // ₦1,500 per farmer sub-order (flat)
     const SERVICE_FEE = 1200;
     const masterOrderId = `KFM-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
     const subOrderCount = farmerMap.size;
 
-    // Calculate grand total first for verification
-    let expectedGrandTotal = 0;
     const tempSubOrders = [];
     for (const [farmerIdStr, farmerItems] of farmerMap.entries()) {
       const subtotal = farmerItems.reduce(
@@ -249,33 +256,15 @@ router.post("/orders", requireAuth, async (req, res) => {
         0,
       );
       const serviceShare = Math.ceil(SERVICE_FEE / subOrderCount);
-      const total = subtotal + DELIVERY_FEE + serviceShare;
-      expectedGrandTotal += total;
+      const total = subtotal + serviceShare;
       tempSubOrders.push({ farmerIdStr, farmerItems, subtotal, serviceShare, total });
-    }
-
-    // Verify payment reference with Paystack
-    if (!paymentReference) {
-      return res.status(400).json({ error: "Payment reference is required to place an order." });
-    }
-
-    const verification = await verifyPaystackPayment(paymentReference);
-    if (!verification.success) {
-      return res.status(400).json({ error: verification.message || "Payment verification failed." });
-    }
-
-    // Allow margin of error up to 10 Naira
-    if (Math.abs(verification.amount - expectedGrandTotal) > 10) {
-      return res.status(400).json({
-        error: `Payment amount mismatch. Expected: ₦${expectedGrandTotal}, Paid: ₦${verification.amount}`,
-      });
     }
 
     // Create one Order per farmer
     const createdOrders = [];
     let subOrderIndex = 1;
     for (const subOrder of tempSubOrders) {
-      const { farmerIdStr, farmerItems, subtotal, total } = subOrder;
+      const { farmerIdStr, farmerItems, subtotal, serviceShare, total } = subOrder;
 
       const orderDoc = await Order.create({
         masterOrderId,
@@ -292,33 +281,156 @@ router.post("/orders", requireAuth, async (req, res) => {
           image: product.images?.[0] || null,
         })),
         subtotal,
-        deliveryFee: DELIVERY_FEE,
+        deliveryFee: 0,
+        serviceFee: serviceShare,
         total,
         paymentMethod: paymentMethod || "card",
-        paymentReference,
-        paymentStatus: "paid",
-        paidAt: new Date(),
+        paymentReference: null,
+        paymentStatus: "pending",
         deliveryAddress,
-        status: "pending",
-      });
-
-      await Escrow.create({
-        orderId: orderDoc._id,
-        masterOrderId,
-        buyerId: userId,
-        farmerId: farmerIdStr,
-        amount: total,
-        status: "pending",
+        status: "awaiting_transport_quote",
+        adminNotes: "Transport fare request submitted. Admin should add the transport fare before payment.",
+        statusNotes: [
+          {
+            status: "awaiting_transport_quote",
+            note: "Buyer requested transport fare review.",
+            createdAt: new Date(),
+          },
+        ],
       });
 
       createdOrders.push(orderDoc);
       subOrderIndex += 1;
     }
 
+    // Send notifications to Admin and Buyer
+    const buyer = await User.findById(userId);
+    if (buyer) {
+      notifyEmail(
+        "Admin transport quote notification",
+        sendAdminTransportQuoteNeededEmail(createdOrders, buyer)
+      );
+      for (const order of createdOrders) {
+        notifyEmail(
+          `Buyer order submitted notification for ${order._id}`,
+          sendBuyerOrderSubmittedEmail(order, buyer.email)
+        );
+      }
+    }
+
     return res.json({ ok: true, orders: createdOrders });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /buyer/orders/:id/pay - pay after admin adds transport fare
+router.post("/orders/:id/pay", requireAuth, async (req, res) => {
+  try {
+    const { paymentReference, paymentMethod } = req.body;
+    if (!paymentReference) {
+      return res.status(400).json({ error: "Payment reference is required." });
+    }
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid order id" });
+    }
+
+    const order = await Order.findOne({
+      _id: req.params.id,
+      buyerId: req.user.sub,
+    });
+
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.status !== "awaiting_payment") {
+      return res.status(400).json({ error: "Order is not ready for payment." });
+    }
+    if (order.deliveryFee <= 0) {
+      return res.status(400).json({ error: "Transport fare has not been added yet." });
+    }
+    if (order.paymentStatus === "paid") {
+      return res.status(400).json({ error: "Order has already been paid." });
+    }
+
+    const verification = await verifyPaystackPayment(paymentReference);
+    if (!verification.success) {
+      return res.status(400).json({ error: verification.message || "Payment verification failed." });
+    }
+
+    if (Math.abs(verification.amount - order.total) > 10) {
+      return res.status(400).json({
+        error: `Payment amount mismatch. Expected: ₦${order.total}, Paid: ₦${verification.amount}`,
+      });
+    }
+
+    const updatedOrder = await Order.findOneAndUpdate(
+      {
+        _id: order._id,
+        buyerId: req.user.sub,
+        paymentStatus: { $ne: "paid" },
+      },
+      {
+        $set: {
+          paymentMethod: paymentMethod || order.paymentMethod || "card",
+          paymentReference,
+          paymentStatus: "paid",
+          paidAt: new Date(),
+          status: "pending",
+          adminNotes: "Payment completed. Order is now awaiting farmer confirmation."
+        },
+        $push: {
+          statusNotes: {
+            status: "pending",
+            note: "Buyer paid after transport fare was added.",
+            createdAt: new Date(),
+          }
+        }
+      },
+      { new: true }
+    );
+
+    if (!updatedOrder) {
+      return res.status(400).json({ error: "Order has already been paid." });
+    }
+
+    await decrementStockForOrder(updatedOrder);
+
+    const existingEscrow = await Escrow.findOne({ orderId: updatedOrder._id });
+    if (!existingEscrow) {
+      await Escrow.create({
+        orderId: updatedOrder._id,
+        masterOrderId: updatedOrder.masterOrderId,
+        buyerId: updatedOrder.buyerId,
+        farmerId: updatedOrder.farmerId,
+        amount: updatedOrder.total,
+        status: "pending",
+      });
+    }
+
+    // Trigger emails non-blockingly
+    const buyer = await User.findById(updatedOrder.buyerId);
+    const farmer = await Farmer.findById(updatedOrder.farmerId).populate("userId", "email");
+    if (buyer?.email) {
+      notifyEmail(
+        "Buyer payment successful notification",
+        sendBuyerPaymentSuccessfulEmail(updatedOrder, buyer.email)
+      );
+    }
+    if (farmer?.userId?.email) {
+      notifyEmail(
+        "Farmer new paid order notification",
+        sendFarmerNewPaidOrderEmail(updatedOrder, farmer.userId.email)
+      );
+    }
+    notifyEmail(
+      "Admin order paid notification",
+      sendAdminOrderPaidEmail(updatedOrder)
+    );
+
+    return res.json({ ok: true, order: updatedOrder });
+  } catch (err) {
+    console.error(err);
+    return res.status(err.status || 500).json({ error: err.message || "Server error" });
   }
 });
 
@@ -381,6 +493,19 @@ router.post("/orders/:id/confirm-receipt", requireAuth, async (req, res) => {
     order.status = "completed";
     order.receiptConfirmedAt = new Date();
     await order.save();
+
+    // Notify admin and farmer
+    const farmer = await Farmer.findById(order.farmerId).populate("userId", "email");
+    notifyEmail(
+      "Admin escrow release alert",
+      sendAdminOrderStatusEmail(order, "Buyer confirmed receipt", "The buyer has confirmed receipt of the order. Escrow can now be released.")
+    );
+    if (farmer?.userId?.email) {
+      notifyEmail(
+        "Farmer payout eligible alert",
+        sendOrderStatusEmail(order, farmer.userId.email, "Buyer confirmed receipt", "The buyer has confirmed receipt of your order. Your payout is now eligible for release.")
+      );
+    }
 
     // Free up driver if assigned and currently processing this order
     if (order.driverId) {
@@ -459,7 +584,7 @@ router.post("/orders/:id/cancel", requireAuth, async (req, res) => {
     });
 
     if (!order) return res.status(404).json({ error: "Order not found" });
-    if (!["pending", "confirmed"].includes(order.status)) {
+    if (!["awaiting_transport_quote", "awaiting_payment", "pending", "confirmed"].includes(order.status)) {
       return res
         .status(400)
         .json({ error: "Order cannot be cancelled at this stage" });
@@ -473,6 +598,25 @@ router.post("/orders/:id/cancel", requireAuth, async (req, res) => {
       reason: order.cancellationReason,
       actorUserId: req.user.sub,
     });
+
+    const buyer = await User.findById(order.buyerId);
+    const farmer = await Farmer.findById(order.farmerId).populate("userId", "email");
+    if (buyer?.email) {
+      notifyEmail(
+        "Buyer order cancelled notification",
+        sendOrderStatusEmail(order, buyer.email, "Order cancelled", `Your order has been cancelled. Reason: ${order.cancellationReason || "Cancelled by buyer"}`)
+      );
+    }
+    if (farmer?.userId?.email) {
+      notifyEmail(
+        "Farmer order cancelled notification",
+        sendOrderStatusEmail(order, farmer.userId.email, "Order cancelled", `The order has been cancelled. Reason: ${order.cancellationReason || "Cancelled by buyer"}`)
+      );
+    }
+    notifyEmail(
+      "Admin order cancelled notification",
+      sendAdminOrderStatusEmail(order, "Order cancelled record", `Order was cancelled. Reason: ${order.cancellationReason || "Cancelled by buyer"}`)
+    );
 
     // Free up driver if assigned and currently processing this order
     if (order.driverId) {

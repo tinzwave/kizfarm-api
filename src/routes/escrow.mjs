@@ -4,6 +4,13 @@ import Order from "../models/Order.mjs";
 import Escrow from "../models/Escrow.mjs";
 import Farmer from "../models/Farmer.mjs";
 import { refundEscrowForOrder, releaseEscrowToFarmer } from "../lib/escrowLedger.mjs";
+import User from "../models/User.mjs";
+import {
+  notifyEmail,
+  sendFarmerPayoutReleasedEmail,
+  sendOrderStatusEmail,
+  sendAdminOrderStatusEmail
+} from "../lib/mailer.mjs";
 
 const router = express.Router();
 
@@ -107,15 +114,24 @@ router.post("/:id/release", requireAdmin, async (req, res) => {
       releaseNotes,
     });
 
-    // TODO: Send email notification to farmer
-    // This would integrate with your email service
     const farmer = await Farmer.findById(escrow.farmerId).populate("userId");
     if (farmer && farmer.userId && farmer.userId.email) {
-      // TODO: sendPayoutNotificationEmail(farmer.userId.email, escrow.amount, order);
-      console.log(
-        `[EMAIL] Payout notification would be sent to ${farmer.userId.email}`
+      notifyEmail(
+        "Farmer payout released notification",
+        sendFarmerPayoutReleasedEmail(order, escrow, farmer.userId.email)
       );
     }
+    const buyer = await User.findById(order.buyerId);
+    if (buyer?.email) {
+      notifyEmail(
+        "Buyer payout released confirmation",
+        sendOrderStatusEmail(order, buyer.email, "Escrow funds released to farmer", "The escrow funds for your order have been released to the farmer.")
+      );
+    }
+    notifyEmail(
+      "Admin payout released confirmation",
+      sendAdminOrderStatusEmail(order, "Escrow funds released", `Escrow funds of NGN ${escrow.amount.toLocaleString()} have been released to the farmer.`)
+    );
 
     res.json({
       success: true,
@@ -151,6 +167,25 @@ router.post("/:id/refund", requireAdmin, async (req, res) => {
       reason: refundReason || "Refunded by admin",
       actorUserId: req.userId,
     });
+
+    const buyer = await User.findById(order.buyerId);
+    const farmer = await Farmer.findById(order.farmerId).populate("userId", "email");
+    if (buyer?.email) {
+      notifyEmail(
+        "Buyer order refunded notification",
+        sendOrderStatusEmail(order, buyer.email, "Order refunded", `Your payment for order has been refunded to your balance. Reason: ${refundReason || "Refunded by admin"}`)
+      );
+    }
+    if (farmer?.userId?.email) {
+      notifyEmail(
+        "Farmer order refunded notification",
+        sendOrderStatusEmail(order, farmer.userId.email, "Order refunded", `The order has been cancelled and refunded.`)
+      );
+    }
+    notifyEmail(
+      "Admin order refunded notification",
+      sendAdminOrderStatusEmail(order, "Order refunded record", `Order was refunded. Reason: ${refundReason || "Refunded by admin"}`)
+    );
 
     res.json({
       success: true,
